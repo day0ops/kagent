@@ -2,6 +2,8 @@ package sts
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -34,7 +36,7 @@ func (e *TokenCacheEntry) HasExpired(bufferSeconds int64) bool {
 // a header provider used by MCP tool transports.
 type TokenPropagationPlugin struct {
 	integration     *STSIntegration
-	tokenCache      map[string]*TokenCacheEntry // keyed by session ID
+	tokenCache      map[string]*TokenCacheEntry // keyed by tokenCacheKey(bearer token)
 	actorTokenCache *TokenCacheEntry            // used only for dynamic fetchActorToken providers
 	mu              sync.RWMutex
 	logger          *slog.Logger
@@ -58,12 +60,12 @@ func NewTokenPropagationPlugin(integration *STSIntegration, logger *slog.Logger,
 	}
 }
 
-// getCachedToken retrieves a valid cached token for the session.
-func (p *TokenPropagationPlugin) getCachedToken(sessionID string) (*TokenCacheEntry, bool) {
+// getCachedToken retrieves a valid cached token for cacheKey.
+func (p *TokenPropagationPlugin) getCachedToken(cacheKey string) (*TokenCacheEntry, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	entry, ok := p.tokenCache[sessionID]
+	entry, ok := p.tokenCache[cacheKey]
 	if !ok {
 		return nil, false
 	}
@@ -75,15 +77,30 @@ func (p *TokenPropagationPlugin) getCachedToken(sessionID string) (*TokenCacheEn
 	return entry, true
 }
 
-// setCachedToken caches a token for the session.
-func (p *TokenPropagationPlugin) setCachedToken(sessionID string, token string, expiry int64) {
+// setCachedToken caches a token under cacheKey.
+func (p *TokenPropagationPlugin) setCachedToken(cacheKey string, token string, expiry int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.tokenCache[sessionID] = &TokenCacheEntry{
+	p.tokenCache[cacheKey] = &TokenCacheEntry{
 		Token:  token,
 		Expiry: expiry,
 	}
+}
+
+// tokenCacheKey derives a stable cache key from the caller's bearer token. This --
+// not the session ID -- is what BeforeRunCallback and HeaderProvider must agree on:
+// the session ID is only reliably available via a type-asserted SessionID() method,
+// which does not survive context derivation once the MCP client library wraps the
+// context (confirmed live and via kagent-dev/kagent and solo-io/kagent-enterprise
+// issue trackers -- see solo-io/kagent-enterprise#2490). The bearer token, reached
+// via ctx.Value(models.BearerTokenKey), does survive that wrapping because context
+// values -- unlike concrete types -- are preserved through arbitrary derivation.
+// Hashing avoids holding the raw credential in the cache's key space for the
+// entry's lifetime.
+func tokenCacheKey(bearerToken string) string {
+	sum := sha256.Sum256([]byte(bearerToken))
+	return hex.EncodeToString(sum[:])
 }
 
 func (p *TokenPropagationPlugin) getCachedActorToken() (*TokenCacheEntry, bool) {
@@ -135,22 +152,9 @@ func (p *TokenPropagationPlugin) BeforeRunCallback(ctx agent.InvocationContext) 
 	if session := ctx.Session(); session != nil {
 		sessionID = session.ID()
 	}
-	if sessionID == "" {
-		p.logger.Debug("no session ID available, skipping token propagation")
-		return nil, nil
-	}
-
-	// Check if we already have a valid cached token for this session.
-	if entry, ok := p.getCachedToken(sessionID); ok {
-		p.logger.Debug("using cached STS token", "session_id", sessionID)
-		if entry.Expiry > 0 {
-			p.logger.Debug("token expiry remaining",
-				"expires_in", time.Until(time.Unix(entry.Expiry, 0)).String())
-		}
-		return nil, nil
-	}
 
 	// Extract bearer token from context. executor.go stores it with models.BearerTokenKey.
+	// This is the cache key (see tokenCacheKey), not the session ID.
 	bearerToken := ""
 	if v := ctx.Value(models.BearerTokenKey); v != nil {
 		if token, ok := v.(string); ok {
@@ -160,6 +164,18 @@ func (p *TokenPropagationPlugin) BeforeRunCallback(ctx agent.InvocationContext) 
 
 	if bearerToken == "" {
 		p.logger.Debug("no bearer token in context, skipping token propagation", "session_id", sessionID)
+		return nil, nil
+	}
+
+	cacheKey := tokenCacheKey(bearerToken)
+
+	// Check if we already have a valid cached token for this caller.
+	if entry, ok := p.getCachedToken(cacheKey); ok {
+		p.logger.Debug("using cached STS token", "session_id", sessionID)
+		if entry.Expiry > 0 {
+			p.logger.Debug("token expiry remaining",
+				"expires_in", time.Until(time.Unix(entry.Expiry, 0)).String())
+		}
 		return nil, nil
 	}
 
@@ -205,12 +221,12 @@ func (p *TokenPropagationPlugin) BeforeRunCallback(ctx agent.InvocationContext) 
 			// Fall back to JWT exp claim for cache TTL.
 			expiry = extractJWTExpiry(exchangedToken)
 		}
-		p.setCachedToken(sessionID, exchangedToken, expiry)
+		p.setCachedToken(cacheKey, exchangedToken, expiry)
 		p.logger.Info("successfully exchanged and cached STS token", "session_id", sessionID)
 	} else {
 		// No STS integration — cache the raw subject token for header injection.
 		expiry := extractJWTExpiry(subjectToken)
-		p.setCachedToken(sessionID, subjectToken, expiry)
+		p.setCachedToken(cacheKey, subjectToken, expiry)
 		p.logger.Debug("cached subject token (no STS exchange)", "session_id", sessionID)
 	}
 
@@ -220,22 +236,25 @@ func (p *TokenPropagationPlugin) BeforeRunCallback(ctx agent.InvocationContext) 
 // AfterRunCallback is called after the ADK run finishes.
 // It cleans up expired tokens from the cache.
 func (p *TokenPropagationPlugin) AfterRunCallback(ctx agent.InvocationContext) {
-	sessionID := ""
-	if session := ctx.Session(); session != nil {
-		sessionID = session.ID()
+	bearerToken := ""
+	if v := ctx.Value(models.BearerTokenKey); v != nil {
+		if token, ok := v.(string); ok {
+			bearerToken = token
+		}
 	}
-	if sessionID == "" {
+	if bearerToken == "" {
 		return
 	}
+	cacheKey := tokenCacheKey(bearerToken)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	// Remove expired subject token.
-	if entry, ok := p.tokenCache[sessionID]; ok {
+	if entry, ok := p.tokenCache[cacheKey]; ok {
 		if entry.HasExpired(p.bufferSeconds) {
-			p.logger.Debug("removing expired subject token from cache", "session_id", sessionID)
-			delete(p.tokenCache, sessionID)
+			p.logger.Debug("removing expired subject token from cache")
+			delete(p.tokenCache, cacheKey)
 		}
 	}
 	if p.actorTokenCache != nil && p.actorTokenCache.HasExpired(p.bufferSeconds) {
@@ -251,44 +270,22 @@ func (p *TokenPropagationPlugin) HeaderProvider(ctx context.Context) map[string]
 		return nil
 	}
 
-	sessionID := sessionIDFromContext(ctx)
-	if sessionID == "" {
-		p.logger.DebugContext(ctx, "no session ID in context, MCP request will use existing headers")
+	bearerToken, ok := ctx.Value(models.BearerTokenKey).(string)
+	if !ok || bearerToken == "" {
+		p.logger.DebugContext(ctx, "no bearer token in context, MCP request will use existing headers")
 		return nil
 	}
 
-	entry, ok := p.getCachedToken(sessionID)
+	entry, ok := p.getCachedToken(tokenCacheKey(bearerToken))
 	if !ok {
-		p.logger.DebugContext(ctx, "no cached STS token for session, MCP request will use existing headers", "session_id", sessionID)
+		p.logger.DebugContext(ctx, "no cached STS token for caller, MCP request will use existing headers")
 		return nil
 	}
 
-	p.logger.DebugContext(ctx, "injecting STS token into MCP request headers", "session_id", sessionID)
+	p.logger.DebugContext(ctx, "injecting STS token into MCP request headers")
 	return map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", entry.Token),
 	}
-}
-
-// Extract session ID from ADK tool / invocation context, which implements SessionID().
-func sessionIDFromContext(ctx context.Context) string {
-	type sessionContext interface {
-		SessionID() string
-	}
-	sessionCtx, ok := ctx.(sessionContext)
-	if !ok {
-		return ""
-	}
-	return sessionCtx.SessionID()
-}
-
-// GetTokenForSession retrieves the cached token for a specific session.
-// Returns empty string if no valid token is cached.
-func (p *TokenPropagationPlugin) GetTokenForSession(sessionID string) string {
-	entry, ok := p.getCachedToken(sessionID)
-	if !ok {
-		return ""
-	}
-	return entry.Token
 }
 
 // ClearCache clears all cached tokens.

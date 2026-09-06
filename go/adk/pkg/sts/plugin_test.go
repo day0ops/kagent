@@ -17,15 +17,6 @@ import (
 	"google.golang.org/genai"
 )
 
-type fakeSessionContext struct {
-	context.Context
-	sessionID string
-}
-
-func (f fakeSessionContext) SessionID() string {
-	return f.sessionID
-}
-
 type fakeInvocationContext struct {
 	context.Context
 	sessionID string
@@ -63,18 +54,43 @@ func (f fakeSession) State() session.State      { return nil }
 func (f fakeSession) Events() session.Events    { return nil }
 func (f fakeSession) LastUpdateTime() time.Time { return time.Time{} }
 
-func TestHeaderProvider_UsesSessionIDMethod(t *testing.T) {
+// TestHeaderProvider_SurvivesContextWrapping is a regression test for
+// solo-io/kagent-enterprise#2490: the MCP client library wraps the context via
+// context.WithValue before HeaderProvider sees it, so any concrete type
+// (including a SessionID() method) is no longer type-assertable -- only
+// ctx.Value lookups for keys already set on an ancestor context survive. This
+// wraps the context the same way to prove the fix (looking up the bearer token
+// via ctx.Value, not a type-asserted session ID) works under that condition.
+func TestHeaderProvider_SurvivesContextWrapping(t *testing.T) {
 	t.Parallel()
 	plugin := NewTokenPropagationPlugin(nil, slog.New(slog.DiscardHandler), nil, nil)
-	plugin.setCachedToken("sess-123", "token-abc", 0)
+	plugin.setCachedToken(tokenCacheKey("subject-token"), "token-abc", 0)
 
-	headers := plugin.HeaderProvider(fakeSessionContext{
-		Context:   context.Background(),
-		sessionID: "sess-123",
-	})
+	ctx := context.WithValue(context.Background(), kagentmodels.BearerTokenKey, "subject-token")
+	// Simulate the MCP client library wrapping the context with an unrelated key,
+	// as it does in practice -- this is what defeats a type-assertion-based lookup.
+	type unrelatedKey struct{}
+	ctx = context.WithValue(ctx, unrelatedKey{}, "irrelevant")
+
+	headers := plugin.HeaderProvider(ctx)
 
 	if headers["Authorization"] != "Bearer token-abc" {
 		t.Fatalf("Authorization header = %q, want %q", headers["Authorization"], "Bearer token-abc")
+	}
+}
+
+// TestHeaderProvider_NoBearerTokenInContext confirms HeaderProvider degrades
+// gracefully (falls back to existing headers) when there's nothing to look up,
+// rather than erroring.
+func TestHeaderProvider_NoBearerTokenInContext(t *testing.T) {
+	t.Parallel()
+	plugin := NewTokenPropagationPlugin(nil, slog.New(slog.DiscardHandler), nil, nil)
+	plugin.setCachedToken(tokenCacheKey("subject-token"), "token-abc", 0)
+
+	headers := plugin.HeaderProvider(context.Background())
+
+	if headers != nil {
+		t.Fatalf("headers = %v, want nil", headers)
 	}
 }
 
@@ -127,11 +143,15 @@ func TestBeforeRunCallback_ReusesCachedDynamicActorTokenForExchange(t *testing.T
 	}
 
 	plugin := NewTokenPropagationPlugin(integration, slog.New(slog.DiscardHandler), nil, nil)
-	for _, sessionID := range []string{"sess-one", "sess-two"} {
-		ctx := context.WithValue(context.Background(), kagentmodels.BearerTokenKey, "subject-token")
+	// Two different callers (distinct subject tokens, the cache key since #2490) in
+	// the same run: each gets its own STS exchange, but the dynamically-fetched
+	// actor token is cached and reused across both, since actor-token caching is
+	// independent of caller identity.
+	for _, subjectToken := range []string{"subject-token-one", "subject-token-two"} {
+		ctx := context.WithValue(context.Background(), kagentmodels.BearerTokenKey, subjectToken)
 		if _, err := plugin.BeforeRunCallback(&fakeInvocationContext{
 			Context:   ctx,
-			sessionID: sessionID,
+			sessionID: "sess-shared",
 		}); err != nil {
 			t.Fatalf("BeforeRunCallback() error = %v", err)
 		}
@@ -142,6 +162,72 @@ func TestBeforeRunCallback_ReusesCachedDynamicActorTokenForExchange(t *testing.T
 	}
 	if exchangeCount != 2 {
 		t.Fatalf("token exchange calls = %d, want 2", exchangeCount)
+	}
+}
+
+// TestBeforeRunCallback_SameBearerTokenAcrossSessionsSharesExchange is a
+// regression test for kagent-dev/kagent#2181: keying the cache by bearer token
+// instead of session ID means two different sessions presenting the *same*
+// caller's token correctly share one exchange, and -- the actual point of
+// #2181 -- two *different* callers sharing the *same* session ID (e.g. a
+// shared A2A conversation) each still get their own, since the key follows the
+// caller, not the conversation.
+func TestBeforeRunCallback_SameBearerTokenAcrossSessionsSharesExchange(t *testing.T) {
+	t.Parallel()
+
+	exchangeCount := 0
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/oauth-authorization-server" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"issuer":         srv.URL,
+				"token_endpoint": srv.URL + "/token",
+			})
+			return
+		}
+		if r.URL.Path != "/token" {
+			http.NotFound(w, r)
+			return
+		}
+		exchangeCount++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":      "access-token",
+			"issued_token_type": string(TokenTypeJWT),
+		})
+	}))
+	defer srv.Close()
+
+	integration, err := NewSTSIntegration(
+		srv.URL+"/.well-known/oauth-authorization-server",
+		"", nil, nil, 5, true, false,
+	)
+	if err != nil {
+		t.Fatalf("NewSTSIntegration() error = %v", err)
+	}
+
+	plugin := NewTokenPropagationPlugin(integration, slog.New(slog.DiscardHandler), nil, nil)
+
+	// Same caller, two different sessions: one exchange, shared.
+	for _, sessionID := range []string{"sess-one", "sess-two"} {
+		ctx := context.WithValue(context.Background(), kagentmodels.BearerTokenKey, "same-caller-token")
+		if _, err := plugin.BeforeRunCallback(&fakeInvocationContext{Context: ctx, sessionID: sessionID}); err != nil {
+			t.Fatalf("BeforeRunCallback() error = %v", err)
+		}
+	}
+	if exchangeCount != 1 {
+		t.Fatalf("token exchange calls after same-caller/different-sessions = %d, want 1", exchangeCount)
+	}
+
+	// Two different callers sharing one session ID (the #2181 scenario): each
+	// still gets its own exchange, since identity follows the token, not the session.
+	for _, subjectToken := range []string{"caller-a-token", "caller-b-token"} {
+		ctx := context.WithValue(context.Background(), kagentmodels.BearerTokenKey, subjectToken)
+		if _, err := plugin.BeforeRunCallback(&fakeInvocationContext{Context: ctx, sessionID: "shared-session"}); err != nil {
+			t.Fatalf("BeforeRunCallback() error = %v", err)
+		}
+	}
+	if exchangeCount != 3 {
+		t.Fatalf("token exchange calls after two different callers sharing a session = %d, want 3 (1 shared + 2 distinct)", exchangeCount)
 	}
 }
 
