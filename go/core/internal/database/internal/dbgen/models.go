@@ -11,16 +11,8 @@ import (
 	pgvector_go "github.com/pgvector/pgvector-go"
 )
 
-type A2aContext struct {
-	ID        uuid.UUID
-	Namespace string
-	UserID    string
-	CreatedAt time.Time
-}
-
 type AgentInstance struct {
 	ID                 uuid.UUID
-	Namespace          string
 	UserID             string
 	RequestID          string
 	PreparedRevision   *string
@@ -30,12 +22,10 @@ type AgentInstance struct {
 	Operation          string
 	ContextID          uuid.UUID
 	SourceCheckpointID *uuid.UUID
-	Name               string
 }
 
 type AgentInstanceCheckpoint struct {
 	ID                   uuid.UUID
-	Namespace            string
 	SourceInstanceID     uuid.UUID
 	UserID               string
 	RequestID            string
@@ -47,8 +37,7 @@ type AgentInstanceCheckpoint struct {
 	SnapshotContentScope string
 	TagUid               string
 	State                string
-	Failure              string
-	CreatedAt            time.Time
+	Data                 []byte
 	SourceContextID      uuid.UUID
 	PreparedRevision     *string
 	SourceLabels         []byte
@@ -56,11 +45,10 @@ type AgentInstanceCheckpoint struct {
 
 type AgentInstanceShare struct {
 	ID         uuid.UUID
-	Namespace  string
 	InstanceID uuid.UUID
 	Permission string
 	TokenHash  []byte
-	CreatedAt  time.Time
+	Data       []byte
 }
 
 type AgentInstanceTask struct {
@@ -87,20 +75,6 @@ type AgentInstanceTaskEvent struct {
 	Data      []byte
 	CreatedAt time.Time
 	MessageID *string
-}
-
-type AgentTemplateHarnessPair struct {
-	Namespace                string
-	AgentTemplateName        string
-	AgentTemplateUid         string
-	HarnessName              string
-	HarnessUid               string
-	DesiredRevision          string
-	LatestSuccessfulRevision *string
-	RetiredAt                *time.Time
-	CreatedAt                time.Time
-	UpdatedAt                time.Time
-	AgentTemplateLabels      []byte
 }
 
 type Memory struct {
